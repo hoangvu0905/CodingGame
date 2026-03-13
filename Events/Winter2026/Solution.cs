@@ -226,6 +226,90 @@ public static class MoveSimulator
             Direction.RIGHT => new Point(head.X + 1, head.Y),
             _               => head,
         };
+
+    /// <summary>
+    /// Returns all body positions after the snake takes one move step.
+    /// The head advances and the rest of the body follows (tail is dropped).
+    /// </summary>
+    public static IList<Point> SimulateBodyAfterMove(IList<Point> body, Direction move)
+    {
+        var result = new List<Point>(body.Count);
+        result.Add(SimulateNextPosition(body[0], move));
+        for (int i = 0; i < body.Count - 1; i++)
+            result.Add(body[i]);
+        return result;
+    }
+
+    /// <summary>
+    /// Simulates gravity on a snake body: the whole body falls downward (Y+1 each step)
+    /// until at least one body part has a solid cell directly below it.
+    /// Returns the settled body positions, or <c>null</c> if the snake falls entirely
+    /// off the bottom of the map and is removed.
+    /// <para>
+    /// Solid cells are: platforms, power sources, and other active snakes' body parts.
+    /// The snake's own body does not support itself during a gravity fall.
+    /// </para>
+    /// </summary>
+    public static IList<Point> ApplyGravity(IList<Point> body, Board board, int snakeId)
+    {
+        var otherBodies = new HashSet<Point>(
+            board.MySnakes.Values
+                .Concat(board.OppSnakes.Values)
+                .Where(s => s.IsActive && s.Id != snakeId && s.Body != null)
+                .SelectMany(s => s.Body)
+        );
+
+        var current = body.ToList();
+        // A snake can fall at most board.Height rows before leaving the map
+        for (int step = 0; step < board.Height; step++)
+        {
+            if (IsGrounded(current, board, otherBodies))
+                return current;
+
+            var next = current.Select(p => new Point(p.X, p.Y + 1)).ToList();
+            // If all body parts have left the map, the snake is removed
+            if (next.All(p => p.Y >= board.Height))
+                return null;
+
+            current = next;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Convenience wrapper: simulates a single move then applies gravity.
+    /// Returns the post-gravity head position, or <c>null</c> if the snake falls off the map.
+    /// </summary>
+    public static Point? SimulateHeadAfterGravity(Board board, Snake snake, Direction move)
+    {
+        var bodyAfterMove = SimulateBodyAfterMove(snake.Body, move);
+        var settled = ApplyGravity(bodyAfterMove, board, snake.Id);
+        return settled?[0];
+    }
+
+    private static bool IsGrounded(IList<Point> body, Board board, HashSet<Point> otherBodies)
+    {
+        foreach (var part in body)
+        {
+            var below = new Point(part.X, part.Y + 1);
+            if (below.X < 0 || below.X >= board.Width) continue; // outside the map horizontally
+            if (below.Y >= board.Height) continue;                // outside the map vertically
+
+            // Platform – map is stored as Point(row, col) = Point(Y, X) in game coordinates
+            var mapKey = new Point(below.Y, below.X);
+            if (board.Map.TryGetValue(mapKey, out bool isFree) && !isFree)
+                return true;
+
+            // Power source (solid according to the problem rules)?
+            if (board.Power.Contains(below))
+                return true;
+
+            // Other snake body part?
+            if (otherBodies.Contains(below))
+                return true;
+        }
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,12 +356,19 @@ public class DangerPenaltyScore : IMoveScoringStrategy
             }
         }
 
+        // Gravity: would the snake fall entirely off the map after this move?
+        var bodyAfterMove = MoveSimulator.SimulateBodyAfterMove(snake.Body, move);
+        if (MoveSimulator.ApplyGravity(bodyAfterMove, state, snake.Id) == null)
+            return Penalty;
+
         return 0.0;
     }
 }
 
 /// <summary>
 /// Rewards moves that bring the snake head closer to the nearest power source.
+/// Uses the post-gravity head position so the distance reflects where the snake
+/// actually lands after falling, not just the raw movement direction.
 /// Returns the negative Manhattan distance so that a shorter distance = higher score.
 /// </summary>
 public class DistanceToPowerScore : IMoveScoringStrategy
@@ -286,10 +377,13 @@ public class DistanceToPowerScore : IMoveScoringStrategy
     {
         if (state.Power.Count == 0) return 0.0;
 
-        var next = MoveSimulator.SimulateNextPosition(snake.Body[0], move);
+        // Use the head position after gravity settles; if the snake falls off the map,
+        // DangerPenaltyScore already applies a large penalty so we just return 0.
+        var head = MoveSimulator.SimulateHeadAfterGravity(state, snake, move);
+        if (head == null) return 0.0;
 
         double minDist = state.Power
-            .Min(p => Math.Abs(p.X - next.X) + Math.Abs(p.Y - next.Y));
+            .Min(p => Math.Abs(p.X - head.Value.X) + Math.Abs(p.Y - head.Value.Y));
 
         return -minDist;
     }
