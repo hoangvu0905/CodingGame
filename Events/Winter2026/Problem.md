@@ -157,18 +157,11 @@ A single line, containing at least one action:
 
 Instructions are separated by semi-columns (**;**). For example:
 
-1 LEFT;2 RIGHT;MARK 12 2
+`1 LEFT;2 RIGHT;MARK 12 2`
 
-**Constraints**Response time per turn ≤ **50**msResponse time for the first turn ≤ **1000**ms**15** ≤ width ≤ **45****10** ≤ height ≤ **30****1** ≤ snakebotCount ≤ **8Download as pdf**
-
-### Console output
-
-Game informationAction (Output Stream)Debug (Errors Stream)**C#**4748495051525354555657585960616263646566676869707172737475767778798081828384858687888990911921{    { **Activating C# Language Assist**
-
-### Players
-
-ide code**HoangVuk07**N/Adelete**Boss 1**N/Adelete
-
-### Actions
-
-**Play my code** **Replay in same conditions**  **Test in arena**
+**Constraints**
+- Response time per turn ≤ **50**ms
+- Response time for the first turn ≤ **1000**ms
+- **15** ≤ width ≤ **45**
+- **10** ≤ height ≤ **30**
+- **1** ≤ snakebotCount ≤ **8**
