@@ -21,6 +21,13 @@ class Player
     {
         var board = new Board();
 
+        var scoringStrategy = new CompositeScoringStrategy(
+        [
+            new DangerPenaltyScore(),
+            new DistanceToPowerScore(),
+            new PowerEatBonusScore(),
+        ]);
+
         string[] inputs;
         board.MyId = int.Parse(Console.ReadLine());
         board.Width = int.Parse(Console.ReadLine());
@@ -74,7 +81,8 @@ class Player
 
             foreach (var (id, snake) in board.MySnakes)
             {
-                board.AddAction(snake.GetActions());
+                if (snake.IsActive)
+                    board.AddAction(snake.GetActions(board, scoringStrategy));
             }
 
             board.DoAction();
@@ -106,6 +114,8 @@ public class Board
         Power.Clear();
         sbAction.Clear();
         sw.Restart();
+        foreach (var snake in MySnakes.Values.Concat(OppSnakes.Values))
+            snake.IsActive = false;
     }
 
     public void AddAction(string action)
@@ -132,11 +142,13 @@ public class Board
 public class Snake
 {
     public int Id { get; set; }
+    public bool IsActive { get; set; }
     public IList<Point> Body { get; set; }
 
     // 0,1:1,1:2,1
     public void UpdateBody(string body)
     {
+        IsActive = true;
         Body = body.Split(':').Select(p =>
         {
             var nums = p.Split(',').Select(int.Parse).ToArray();
@@ -144,20 +156,21 @@ public class Snake
         }).ToList();
     }
 
-    public string GetActions()
+    public string GetActions(Board board, IMoveScoringStrategy scoringStrategy)
     {
         var dirs = GetNextDirectionAvailable().ToList();
-        if (dirs.Count > 0)
-        {
-            return GoTo(dirs[0]);
-        }
+        if (dirs.Count == 0) return "";
 
-        return "";
+        var bestDir = dirs
+            .OrderByDescending(d => scoringStrategy.Score(board, this, d))
+            .First();
+
+        return GoTo(bestDir);
     }
 
-    private string GoTo(Direction direction, string messsage = null)
+    private string GoTo(Direction direction, string message = null)
     {
-        return $"{Id} {direction.ToString()} {Id}-{direction.ToString()}{(!string.IsNullOrEmpty(messsage) ? ":": "")}{messsage};";
+        return $"{Id} {direction.ToString()} {Id}-{direction.ToString()}{(!string.IsNullOrEmpty(message) ? ":": "")}{message};";
     }
 
     public Direction GetDirection()
@@ -192,4 +205,124 @@ public enum Direction
     DOWN = 1,
     LEFT = 2,
     RIGHT = 3
+}
+
+// ---------------------------------------------------------------------------
+// Move simulation
+// ---------------------------------------------------------------------------
+
+public static class MoveSimulator
+{
+    /// <summary>
+    /// Returns the position the snake head would occupy after taking <paramref name="move"/>.
+    /// Coordinate system: X = column (0 = left), Y = row (0 = top).
+    /// </summary>
+    public static Point SimulateNextPosition(Point head, Direction move) =>
+        move switch
+        {
+            Direction.UP    => new Point(head.X, head.Y - 1),
+            Direction.DOWN  => new Point(head.X, head.Y + 1),
+            Direction.LEFT  => new Point(head.X - 1, head.Y),
+            Direction.RIGHT => new Point(head.X + 1, head.Y),
+            _               => head,
+        };
+}
+
+// ---------------------------------------------------------------------------
+// Scoring strategy interface & implementations
+// ---------------------------------------------------------------------------
+
+/// <summary>Evaluates how desirable a particular move is for a given snake.</summary>
+public interface IMoveScoringStrategy
+{
+    double Score(Board state, Snake snake, Direction move);
+}
+
+/// <summary>
+/// Applies a large penalty for moves that are immediately lethal:
+/// out-of-bounds, into a platform, or into any snake body.
+/// </summary>
+public class DangerPenaltyScore : IMoveScoringStrategy
+{
+    private const double Penalty = -1000.0;
+
+    public double Score(Board state, Snake snake, Direction move)
+    {
+        var next = MoveSimulator.SimulateNextPosition(snake.Body[0], move);
+
+        // Out of bounds
+        if (next.X < 0 || next.X >= state.Width || next.Y < 0 || next.Y >= state.Height)
+            return Penalty;
+
+        // Platform – map is stored as Point(row, col) = Point(Y, X) in game coordinates
+        var mapKey = new Point(next.Y, next.X);
+        if (state.Map.TryGetValue(mapKey, out bool isFree) && !isFree)
+            return Penalty;
+
+        // Collision with any active snake body
+        foreach (var s in state.MySnakes.Values.Concat(state.OppSnakes.Values))
+        {
+            if (!s.IsActive || s.Body == null) continue;
+
+            // Own tail will move away this turn, so skip it; all other segments stay
+            var segments = s.Id == snake.Id ? s.Body.SkipLast(1) : s.Body.AsEnumerable();
+            foreach (var segment in segments)
+            {
+                if (segment == next) return Penalty;
+            }
+        }
+
+        return 0.0;
+    }
+}
+
+/// <summary>
+/// Rewards moves that bring the snake head closer to the nearest power source.
+/// Returns the negative Manhattan distance so that a shorter distance = higher score.
+/// </summary>
+public class DistanceToPowerScore : IMoveScoringStrategy
+{
+    public double Score(Board state, Snake snake, Direction move)
+    {
+        if (state.Power.Count == 0) return 0.0;
+
+        var next = MoveSimulator.SimulateNextPosition(snake.Body[0], move);
+
+        double minDist = state.Power
+            .Min(p => Math.Abs(p.X - next.X) + Math.Abs(p.Y - next.Y));
+
+        return -minDist;
+    }
+}
+
+/// <summary>
+/// Gives a bonus when the snake head lands directly on a power source,
+/// rewarding moves that immediately collect one.
+/// </summary>
+public class PowerEatBonusScore : IMoveScoringStrategy
+{
+    private const double Bonus = 500.0;
+
+    public double Score(Board state, Snake snake, Direction move)
+    {
+        var next = MoveSimulator.SimulateNextPosition(snake.Body[0], move);
+        return state.Power.Contains(next) ? Bonus : 0.0;
+    }
+}
+
+/// <summary>
+/// Aggregates multiple <see cref="IMoveScoringStrategy"/> implementations by summing
+/// their individual scores, following the Composite / Strategy pattern.
+/// </summary>
+public class CompositeScoringStrategy : IMoveScoringStrategy
+{
+    private readonly IReadOnlyList<IMoveScoringStrategy> _strategies;
+
+    public CompositeScoringStrategy(IReadOnlyList<IMoveScoringStrategy> strategies)
+    {
+        _strategies = strategies;
+    }
+
+    public double Score(Board state, Snake snake, Direction move) =>
+        _strategies.Sum(s => s.Score(state, snake, move));
 }
