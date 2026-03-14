@@ -44,12 +44,12 @@ class Player
         for (int i = 0; i < board.NumberSnake; i++)
         {
             int mySnakebotId = int.Parse(Console.ReadLine());
-            board.MySnakes.Add(mySnakebotId, new Snake() { Id = mySnakebotId });
+            board.MySnakeIds.Add(mySnakebotId);
         }
         for (int i = 0; i < board.NumberSnake; i++)
         {
             int oppSnakebotId = int.Parse(Console.ReadLine());
-            board.OppSnakes.Add(oppSnakebotId, new Snake() { Id = oppSnakebotId });
+            board.OppSnakeIds.Add(oppSnakebotId);
         }
 
         // game loop
@@ -70,19 +70,21 @@ class Player
             {
                 inputs = Console.ReadLine().Split(' ');
                 int snakebotId = int.Parse(inputs[0]);
-                string body = inputs[1];
+                string bodyStr = inputs[1];
 
-                var snake = board.MySnakes.GetValueOrDefault(snakebotId) ?? board.OppSnakes[snakebotId];
-                snake.UpdateBody(body);
+                var body = SnakeHelper.ParseBody(bodyStr);
+                if (board.MySnakeIds.Contains(snakebotId))
+                    board.MySnake[snakebotId] = body;
+                else
+                    board.OppSnake[snakebotId] = body;
             }
 
             // Write an action using Console.WriteLine()
             // To debug: Console.Error.WriteLine("Debug messages...");
 
-            foreach (var (id, snake) in board.MySnakes)
+            foreach (var (id, body) in board.MySnake)
             {
-                if (snake.IsActive)
-                    board.AddAction(snake.GetActions(board, scoringStrategy));
+                board.AddAction(SnakeHelper.GetActions(id, body, board, scoringStrategy));
             }
 
             board.DoAction();
@@ -98,9 +100,23 @@ public class Board
     public int Turn { get; set; }
 
     public int NumberSnake { get; set; }
-    public Dictionary<int, Snake> MySnakes { get; set; } = [];
-    public Dictionary<int, Snake> OppSnakes { get; set; } = [];
 
+    /// <summary>IDs registered during initialization for each side (stable across rounds).</summary>
+    public HashSet<int> MySnakeIds { get; set; } = [];
+    public HashSet<int> OppSnakeIds { get; set; } = [];
+
+    /// <summary>Active snakes this round: snakeId → body (head-first list of Points).</summary>
+    /// <remarks>
+    /// Map lookup uses <c>Point(row, col) = Point(Y, X)</c> game-coordinates. See <see cref="Map"/>.
+    /// </remarks>
+    public Dictionary<int, IList<Point>> MySnake { get; set; } = [];
+    public Dictionary<int, IList<Point>> OppSnake { get; set; } = [];
+
+    /// <summary>
+    /// Passability of each grid cell. Key is <c>Point(row, col)</c> = <c>Point(Y, X)</c>
+    /// in game coordinates where X=column and Y=row (top=0).
+    /// Value is <c>true</c> for a free cell, <c>false</c> for a platform.
+    /// </summary>
     public Dictionary<Point, bool> Map { get; set; } = [];
 
     public IList<Point> Power { get; set; } = [];
@@ -114,8 +130,8 @@ public class Board
         Power.Clear();
         sbAction.Clear();
         sw.Restart();
-        foreach (var snake in MySnakes.Values.Concat(OppSnakes.Values))
-            snake.IsActive = false;
+        MySnake.Clear();
+        OppSnake.Clear();
     }
 
     public void AddAction(string action)
@@ -139,44 +155,25 @@ public class Board
 }
 
 
-public class Snake
+public static class SnakeHelper
 {
-    public int Id { get; set; }
-    public bool IsActive { get; set; }
-    public IList<Point> Body { get; set; }
-
-    // 0,1:1,1:2,1
-    public void UpdateBody(string body)
-    {
-        IsActive = true;
-        Body = body.Split(':').Select(p =>
+    /// <summary>Parses a colon-separated body string into a head-first list of Points.</summary>
+    /// <example>"0,1:1,1:2,1" → [(0,1),(1,1),(2,1)]</example>
+    public static IList<Point> ParseBody(string body) =>
+        body.Split(':').Select(p =>
         {
             var nums = p.Split(',').Select(int.Parse).ToArray();
             return new Point(nums[0], nums[1]);
         }).ToList();
-    }
 
-    public string GetActions(Board board, IMoveScoringStrategy scoringStrategy)
+    /// <summary>Returns the direction the snake is currently facing based on head and next body part.</summary>
+    public static Direction GetDirection(IList<Point> body)
     {
-        var dirs = GetNextDirectionAvailable().ToList();
-        if (dirs.Count == 0) return "";
+        if (body.Count < 2)
+            return Direction.UP; // single-part snake — default to UP (will be removed by the game shortly)
 
-        var bestDir = dirs
-            .OrderByDescending(d => scoringStrategy.Score(board, this, d))
-            .First();
-
-        return GoTo(bestDir);
-    }
-
-    private string GoTo(Direction direction, string message = null)
-    {
-        return $"{Id} {direction.ToString()} {Id}-{direction.ToString()}{(!string.IsNullOrEmpty(message) ? ":": "")}{message};";
-    }
-
-    public Direction GetDirection()
-    {
-        var first = Body[0];
-        var second = Body[1];
+        var first = body[0];
+        var second = body[1];
 
         if (first.X < second.X) return Direction.LEFT;
         if (first.X > second.X) return Direction.RIGHT;
@@ -184,13 +181,34 @@ public class Snake
         return first.Y < second.Y ? Direction.UP : Direction.DOWN;
     }
 
-    public IEnumerable<Direction> GetNextDirectionAvailable()
+    /// <summary>Enumerates all directions the snake may turn (excludes immediate 180° reversal).</summary>
+    public static IEnumerable<Direction> GetNextDirectionAvailable(IList<Point> body)
     {
         foreach (var dir in Constants.AllDirections)
         {
-            if (((int)dir ^ 1) == (int)GetDirection()) continue;
+            // Direction enum: UP=0, DOWN=1, LEFT=2, RIGHT=3.
+            // XOR with 1 maps each direction to its opposite: UP↔DOWN (0↔1), LEFT↔RIGHT (2↔3).
+            if (((int)dir ^ 1) == (int)GetDirection(body)) continue;
             yield return dir;
         }
+    }
+
+    /// <summary>Chooses and returns the best action string for this snake this turn.</summary>
+    public static string GetActions(int snakeId, IList<Point> body, Board board, IMoveScoringStrategy scoringStrategy)
+    {
+        var dirs = GetNextDirectionAvailable(body).ToList();
+        if (dirs.Count == 0) return "";
+
+        var bestDir = dirs
+            .OrderByDescending(d => scoringStrategy.Score(board, snakeId, body, d))
+            .First();
+
+        return GoTo(snakeId, bestDir);
+    }
+
+    private static string GoTo(int id, Direction direction, string message = null)
+    {
+        return $"{id} {direction.ToString()} {id}-{direction.ToString()}{(!string.IsNullOrEmpty(message) ? ":" : "")}{message};";
     }
 }
 
@@ -253,10 +271,10 @@ public static class MoveSimulator
     public static IList<Point> ApplyGravity(IList<Point> body, Board board, int snakeId)
     {
         var otherBodies = new HashSet<Point>(
-            board.MySnakes.Values
-                .Concat(board.OppSnakes.Values)
-                .Where(s => s.IsActive && s.Id != snakeId && s.Body != null)
-                .SelectMany(s => s.Body)
+            board.MySnake
+                .Concat(board.OppSnake)
+                .Where(kvp => kvp.Key != snakeId && kvp.Value != null)
+                .SelectMany(kvp => kvp.Value)
         );
 
         var current = body.ToList();
@@ -280,10 +298,10 @@ public static class MoveSimulator
     /// Convenience wrapper: simulates a single move then applies gravity.
     /// Returns the post-gravity head position, or <c>null</c> if the snake falls off the map.
     /// </summary>
-    public static Point? SimulateHeadAfterGravity(Board board, Snake snake, Direction move)
+    public static Point? SimulateHeadAfterGravity(Board board, int snakeId, IList<Point> body, Direction move)
     {
-        var bodyAfterMove = SimulateBodyAfterMove(snake.Body, move);
-        var settled = ApplyGravity(bodyAfterMove, board, snake.Id);
+        var bodyAfterMove = SimulateBodyAfterMove(body, move);
+        var settled = ApplyGravity(bodyAfterMove, board, snakeId);
         return settled?[0];
     }
 
@@ -319,7 +337,7 @@ public static class MoveSimulator
 /// <summary>Evaluates how desirable a particular move is for a given snake.</summary>
 public interface IMoveScoringStrategy
 {
-    double Score(Board state, Snake snake, Direction move);
+    double Score(Board state, int snakeId, IList<Point> body, Direction move);
 }
 
 /// <summary>
@@ -330,9 +348,9 @@ public class DangerPenaltyScore : IMoveScoringStrategy
 {
     private const double Penalty = -1000.0;
 
-    public double Score(Board state, Snake snake, Direction move)
+    public double Score(Board state, int snakeId, IList<Point> body, Direction move)
     {
-        var next = MoveSimulator.SimulateNextPosition(snake.Body[0], move);
+        var next = MoveSimulator.SimulateNextPosition(body[0], move);
 
         // Out of bounds
         if (next.X < 0 || next.X >= state.Width || next.Y < 0 || next.Y >= state.Height)
@@ -344,12 +362,15 @@ public class DangerPenaltyScore : IMoveScoringStrategy
             return Penalty;
 
         // Collision with any active snake body
-        foreach (var s in state.MySnakes.Values.Concat(state.OppSnakes.Values))
+        foreach (var (id, otherBody) in state.MySnake.Concat(state.OppSnake))
         {
-            if (!s.IsActive || s.Body == null) continue;
+            if (otherBody == null) continue;
 
-            // Own tail will move away this turn, so skip it; all other segments stay
-            var segments = s.Id == snake.Id ? s.Body.SkipLast(1) : s.Body.AsEnumerable();
+            // Own tail will move away this turn so is no longer a collision risk.
+            // Growth (after eating power) adds a new tail segment that appears at the old tail
+            // position, which is the segment we skip here — so the collision-free slot is correct
+            // in both the normal and growth cases.
+            var segments = id == snakeId ? otherBody.SkipLast(1) : otherBody.AsEnumerable();
             foreach (var segment in segments)
             {
                 if (segment == next) return Penalty;
@@ -357,8 +378,8 @@ public class DangerPenaltyScore : IMoveScoringStrategy
         }
 
         // Gravity: would the snake fall entirely off the map after this move?
-        var bodyAfterMove = MoveSimulator.SimulateBodyAfterMove(snake.Body, move);
-        if (MoveSimulator.ApplyGravity(bodyAfterMove, state, snake.Id) == null)
+        var bodyAfterMove = MoveSimulator.SimulateBodyAfterMove(body, move);
+        if (MoveSimulator.ApplyGravity(bodyAfterMove, state, snakeId) == null)
             return Penalty;
 
         return 0.0;
@@ -373,13 +394,13 @@ public class DangerPenaltyScore : IMoveScoringStrategy
 /// </summary>
 public class DistanceToPowerScore : IMoveScoringStrategy
 {
-    public double Score(Board state, Snake snake, Direction move)
+    public double Score(Board state, int snakeId, IList<Point> body, Direction move)
     {
         if (state.Power.Count == 0) return 0.0;
 
         // Use the head position after gravity settles; if the snake falls off the map,
         // DangerPenaltyScore already applies a large penalty so we just return 0.
-        var head = MoveSimulator.SimulateHeadAfterGravity(state, snake, move);
+        var head = MoveSimulator.SimulateHeadAfterGravity(state, snakeId, body, move);
         if (head == null) return 0.0;
 
         double minDist = state.Power
@@ -397,9 +418,9 @@ public class PowerEatBonusScore : IMoveScoringStrategy
 {
     private const double Bonus = 500.0;
 
-    public double Score(Board state, Snake snake, Direction move)
+    public double Score(Board state, int snakeId, IList<Point> body, Direction move)
     {
-        var next = MoveSimulator.SimulateNextPosition(snake.Body[0], move);
+        var next = MoveSimulator.SimulateNextPosition(body[0], move);
         return state.Power.Contains(next) ? Bonus : 0.0;
     }
 }
@@ -417,6 +438,6 @@ public class CompositeScoringStrategy : IMoveScoringStrategy
         _strategies = strategies;
     }
 
-    public double Score(Board state, Snake snake, Direction move) =>
-        _strategies.Sum(s => s.Score(state, snake, move));
+    public double Score(Board state, int snakeId, IList<Point> body, Direction move) =>
+        _strategies.Sum(s => s.Score(state, snakeId, body, move));
 }
